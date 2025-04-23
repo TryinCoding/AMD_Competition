@@ -1,88 +1,101 @@
+from torch.utils.cpp_extension import load_inline
 import torch
 from task import input_t, output_t
-from utils import make_match_reference
 
+CPP_WRAPPER = """
+void fp8_mm(torch::Tensor a, torch::Tensor b, torch::Tensor as, torch::Tensor bs, torch::Tensor c);
+"""
 
-block_shape = (128, 128)
+CUDA_SRC = """
+#include <hip/amd_detail/amd_hip_fp8.h>
+#include <hip/amd_detail/amd_hip_bf16.h>
 
-def generate_input(m: int, n: int, k: int, seed: int) -> input_t:
-    """
-    Generate random input and weights for Blockwise W8A8 Matmul scaled to FP32.
-    
-    Returns:
-        Tuple of (
-            a: torch.Tensor[float8_e4m3fnuz] of shape [m, k], 
-            b: torch.Tensor[float8_e4m3fnuz] of shape [n, k], 
-            a_scale: torch.Tensor[float32] of shape [m, k // 128], 
-            b_scale: torch.Tensor[float32] of shape [n // 128, k // 128], 
-            c: torch.Tensor[bfloat16] of shape [m, n]
-        )
-    """
-    gen = torch.Generator(device='cuda')
-    gen.manual_seed(seed)
-    block_shape_n, block_shape_k = block_shape
-    scale_n =  (n + block_shape_n - 1) // block_shape_n
-    scale_k =  (k + block_shape_k - 1) // block_shape_k
+constexpr const int TILE_M = 16;
+constexpr const int TILE_N = 16;
+constexpr const int BLOCK = 128;
 
-    # Generate random inputs with FP8 quantization
-    a = (torch.randn((k, m), dtype=torch.bfloat16, device="cuda", generator=gen)).to(torch.float8_e4m3fnuz)
-    b = (torch.randn((k, n), dtype=torch.bfloat16, device="cuda", generator=gen)).to(torch.float8_e4m3fnuz)
+__global__ void tiled_kernel(const __hip_fp8_e4m3_fnuz* a, const __hip_fp8_e4m3_fnuz* b, const float* as, const float* bs,
+                             __hip_bfloat16* c, int m, int n, int k) {
+    int row = threadIdx.y + blockIdx.y * TILE_M;
+    int col = threadIdx.x + blockIdx.x * TILE_N;
 
-    # Generate scaling factors with FP32
-    a_scale = torch.randn([scale_k, m], dtype=torch.float32, device="cuda", generator=gen)
-    b_scale = torch.randn([scale_k, scale_n], dtype=torch.float32, device="cuda", generator=gen)
+    if (row >= m || col >= n) return;
 
+    __shared__ float a_tile[TILE_M][BLOCK];
+    __shared__ float b_tile[TILE_N][BLOCK];
 
-    c = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
-    return (a.T, b.T, a_scale.T, b_scale.T, c)
+    float acc = 0.0f;
+
+    int num_blocks_k = k / BLOCK;
+    int sn = (n + BLOCK - 1) / BLOCK;
+
+    for (int blk = 0; blk < num_blocks_k; ++blk) {
+        int base_k = blk * BLOCK;
+
+        // Load tiles from global to shared memory
+        for (int i = threadIdx.x; i < BLOCK; i += TILE_N) {
+            if (row < m && base_k + i < k) {
+                a_tile[threadIdx.y][i] = (float)a[row + (base_k + i) * m];
+            }
+        }
+
+        for (int i = threadIdx.y; i < BLOCK; i += TILE_M) {
+            if (col < n && base_k + i < k) {
+                b_tile[threadIdx.x][i] = (float)b[col + (base_k + i) * n];
+            }
+        }
+
+        __syncthreads();
+
+        float block_sum = 0.0f;
+        for (int i = 0; i < BLOCK; ++i) {
+            block_sum += a_tile[threadIdx.y][i] * b_tile[threadIdx.x][i];
+        }
+
+        __syncthreads();
+
+        // Apply scale for this block
+        float a_scale = as[row + blk * m];                     // [m x (k/BLOCK)] column-major
+        float b_scale = bs[(col / BLOCK) + blk * sn];         // [(n/BLOCK) x (k/BLOCK)] row-major
+        acc += block_sum * a_scale * b_scale;
+    }
+
+    // Store result
+    c[row * n + col] = (__hip_bfloat16)acc; // row-major output
+}
+
+void fp8_mm(torch::Tensor a, torch::Tensor b, torch::Tensor as, torch::Tensor bs, torch::Tensor c) {
+    int m = a.size(0);
+    int n = b.size(0);
+    int k = a.size(1);
+    dim3 threads(16, 16);
+    dim3 blocks((n + 15) / 16, (m + 15) / 16);
+
+    tiled_kernel<<<blocks, threads, 0, 0>>>(
+        (__hip_fp8_e4m3_fnuz*)a.data_ptr(),
+        (__hip_fp8_e4m3_fnuz*)b.data_ptr(),
+        as.data_ptr<float>(),
+        bs.data_ptr<float>(),
+        (__hip_bfloat16*)c.data_ptr(),
+        m, n, k
+    );
+}
+"""
+
+import os
+os.environ["CXX"] = "clang++"
+
+module = load_inline(
+    name='fp8_mm',
+    cpp_sources=[CPP_WRAPPER],
+    cuda_sources=[CUDA_SRC],
+    functions=['fp8_mm'],
+    verbose=True,
+    extra_cuda_cflags=["--offload-arch=gfx942", "-std=c++20"],
+)
 
 
 def custom_kernel(data: input_t) -> output_t:
-    """
-    Highly inefficient torch reference implementation of FP8 GEMM.
-    You can use this as a reference / starting template for your implementation.
-    """
-    # c: [m, n] is pre-allocated memory to help remove allocation overhead.
     a, b, a_scale, b_scale, c = data
-
-    # a is M x K in column-major order, we convert here for simplicity.
-    a = a.contiguous()
-    a_scale = a_scale.contiguous()
-    b_scale = b_scale.contiguous()
-
-    # constants
-    m = a.shape[0]
-    n = b.shape[0]
-    k = a.shape[1]
-    block_shape_n = 128
-    block_shape_k = 128
-    scale_n = b_scale.shape[0]
-    scale_k = b_scale.shape[1]
-
-    # Apply blockwise scaling to input 'a'
-    a_scale = a_scale.unsqueeze(-1).repeat(1, 1, block_shape_k)  # Shape: [m, scale_k, block_shape_k]
-    a_scale = a_scale.reshape(m, scale_k * block_shape_k) 
-    a_scale = a_scale[:, :k]
-
-    # Dequantize 'a', in your implementation you should do this at the end.
-    a = a.to(a_scale.dtype) * a_scale 
-
-    # Apply blockwise scaling to input 'b'
-    b_scale = (
-        b_scale.view(-1, 1)
-        .repeat(1, block_shape_n * block_shape_k)
-        .view(scale_n, scale_k, block_shape_n, block_shape_k)
-        .permute(0, 2, 1, 3)  # Reorder dimensions: [scale_n, blk_n, scale_k, blk_k]
-        .reshape(scale_n * block_shape_n, scale_k * block_shape_k)
-    )
-    b_scale = b_scale[:n, :k]
-
-    # Dequantize 'b', in your implementation you should do this at the end.
-    b = b.to(b_scale.dtype) * b_scale 
-
-    # Compute FP8 GEMM and write to 'c'. 
-    c[...] = (a @ b.T).to(torch.bfloat16)
+    module.fp8_mm(a, b, a_scale, b_scale, c)
     return c
-
-
-check_implementation = make_match_reference(custom_kernel, rtol=2e-02, atol=1e-03)
